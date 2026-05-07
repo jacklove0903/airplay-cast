@@ -1,12 +1,12 @@
-import { RTCPeerConnection, RTCRtpCodecParameters } from 'werift'
+import { RTCPeerConnection, RTCRtpCodecParameters, MediaStreamTrack, RtpPacket, RtpHeader } from 'werift'
 import { EventEmitter } from 'events'
 
 export class WebRTCBridge extends EventEmitter {
   private pc: RTCPeerConnection | null = null
-  private videoTrack: any = null
-  private nalBuffer: Buffer[] = []
-  private frameTimestamp = 0
-  private sendInterval: NodeJS.Timeout | null = null
+  private videoTrack: MediaStreamTrack | null = null
+  private seqNumber = 0
+  private timestamp = 0
+  private ssrc = 0
 
   constructor() {
     super()
@@ -25,9 +25,10 @@ export class WebRTCBridge extends EventEmitter {
       },
     })
 
-    // Add transceiver for sending video
-    const transceiver = this.pc.addTransceiver('video', { direction: 'sendonly' })
-    this.videoTrack = transceiver.sender
+    // Create a MediaStreamTrack for sending
+    this.videoTrack = new MediaStreamTrack({ kind: 'video' })
+    const transceiver = this.pc.addTransceiver(this.videoTrack, { direction: 'sendonly' })
+    this.ssrc = transceiver.sender.ssrc
 
     // Handle ICE candidates
     this.pc.onIceCandidate.subscribe((candidate) => {
@@ -61,45 +62,48 @@ export class WebRTCBridge extends EventEmitter {
     await this.pc.addIceCandidate(candidate)
   }
 
-  // Feed H.264 NAL units into the WebRTC track
+  // Feed H.264 NAL units into the WebRTC track as RTP packets
   feedNALUnits(nalUnits: Buffer[], info: { timestamp: number; marker: number }) {
-    if (!this.pc || this.pc.connectionState !== 'connected') return
+    if (!this.pc || this.pc.connectionState !== 'connected' || !this.videoTrack) return
 
-    // Buffer NAL units and send as a frame
-    for (const nal of nalUnits) {
-      // Add start code prefix for the RTP sender
-      const startCode = Buffer.from([0x00, 0x00, 0x00, 0x01])
-      const frame = Buffer.concat([startCode, nal])
-      this.nalBuffer.push(frame)
-    }
+    // 90kHz clock: ~3000 ticks per frame at 30fps
+    this.timestamp += 3000
 
-    // Send on marker bit (end of frame)
-    if (info.marker && this.nalBuffer.length > 0) {
-      const fullFrame = Buffer.concat(this.nalBuffer)
-      this.nalBuffer = []
+    for (let i = 0; i < nalUnits.length; i++) {
+      let nal = nalUnits[i]
 
-      // Use RTCPeerConnection's RTP sender
-      // werift uses track.writeRtp or sender.sendRtp
-      try {
-        if (this.videoTrack?.track) {
-          this.frameTimestamp = info.timestamp
-          this.videoTrack.track.writeRtp(fullFrame)
+      // Strip start code prefix if present (annex-B format)
+      if (nal.length >= 4 && nal[0] === 0x00 && nal[1] === 0x00) {
+        if (nal[2] === 0x00 && nal[3] === 0x01) {
+          nal = nal.subarray(4)
+        } else if (nal[2] === 0x01) {
+          nal = nal.subarray(3)
         }
+      }
+
+      const isLast = i === nalUnits.length - 1
+      const header = new RtpHeader({
+        payloadType: 96,
+        sequenceNumber: this.seqNumber++,
+        timestamp: this.timestamp,
+        ssrc: this.ssrc,
+        marker: isLast,
+      })
+
+      try {
+        this.videoTrack.writeRtp(new RtpPacket(header, nal))
       } catch (err) {
-        // Silently ignore RTP send errors
+        console.error('[WebRTC] writeRtp error:', err)
       }
     }
   }
 
   close() {
-    if (this.sendInterval) {
-      clearInterval(this.sendInterval)
-      this.sendInterval = null
-    }
     this.pc?.close()
     this.pc = null
     this.videoTrack = null
-    this.nalBuffer = []
+    this.seqNumber = 0
+    this.timestamp = 0
     console.log('[WebRTC] Connection closed')
   }
 }

@@ -71,43 +71,47 @@ function broadcast(msg: object) {
 const bridges = new Map<WebSocket, WebRTCBridge>()
 
 async function handleSignaling(ws: WebSocket, msg: any) {
-  switch (msg.type) {
-    case 'start': {
-      // Client wants to start receiving video
-      let bridge = bridges.get(ws)
-      if (!bridge) {
-        bridge = new WebRTCBridge()
-        bridges.set(ws, bridge)
+  try {
+    switch (msg.type) {
+      case 'start': {
+        // Client wants to start receiving video
+        let bridge = bridges.get(ws)
+        if (!bridge) {
+          bridge = new WebRTCBridge()
+          bridges.set(ws, bridge)
 
-        bridge.on('ice-candidate', (candidate) => {
-          ws.send(JSON.stringify({ type: 'ice-candidate', data: candidate }))
-        })
+          bridge.on('ice-candidate', (candidate) => {
+            ws.send(JSON.stringify({ type: 'ice-candidate', data: candidate }))
+          })
 
-        bridge.on('connection-state', (connState) => {
-          ws.send(JSON.stringify({ type: 'connection-state', data: connState }))
-        })
+          bridge.on('connection-state', (connState) => {
+            ws.send(JSON.stringify({ type: 'connection-state', data: connState }))
+          })
+        }
+
+        const offer = await bridge.createOffer()
+        ws.send(JSON.stringify({ type: 'offer', data: offer }))
+        break
       }
 
-      const offer = await bridge.createOffer()
-      ws.send(JSON.stringify({ type: 'offer', data: offer }))
-      break
-    }
-
-    case 'answer': {
-      const bridge = bridges.get(ws)
-      if (bridge) {
-        await bridge.handleAnswer(msg.data.sdp, msg.data.type)
+      case 'answer': {
+        const bridge = bridges.get(ws)
+        if (bridge) {
+          await bridge.handleAnswer(msg.data.sdp, msg.data.type)
+        }
+        break
       }
-      break
-    }
 
-    case 'ice-candidate': {
-      const bridge = bridges.get(ws)
-      if (bridge) {
-        await bridge.addIceCandidate(msg.data)
+      case 'ice-candidate': {
+        const bridge = bridges.get(ws)
+        if (bridge) {
+          await bridge.addIceCandidate(msg.data)
+        }
+        break
       }
-      break
     }
+  } catch (err) {
+    console.error('[Signaling] Error:', err)
   }
 }
 

@@ -20,6 +20,8 @@ export class AirPlayServer extends EventEmitter {
   private controlPort: number
   private videoPort: number
   private audioPort: number
+  private fuBuffer: Buffer[] = []
+  private udpSockets: dgram.Socket[] = []
 
   constructor(controlPort = 7100) {
     super()
@@ -51,12 +53,18 @@ export class AirPlayServer extends EventEmitter {
   stop() {
     this.server?.close()
     this.server = null
+    for (const sock of this.udpSockets) {
+      try { sock.close() } catch {}
+    }
+    this.udpSockets = []
+    this.fuBuffer = []
   }
 
   private handleConnection(socket: net.Socket) {
     let buffer = Buffer.alloc(0)
     const clientAddr = `${socket.remoteAddress}:${socket.remotePort}`
     console.log(`[RTSP] Client connected: ${clientAddr}`)
+    this.fuBuffer = []
     this.emit('client-connected', clientAddr)
 
     socket.on('data', (data: Buffer) => {
@@ -273,6 +281,7 @@ export class AirPlayServer extends EventEmitter {
 
   private startRTPListener(type: 'video' | 'audio', port: number) {
     const udpSocket = dgram.createSocket('udp4')
+    this.udpSockets.push(udpSocket)
 
     udpSocket.on('message', (msg: Buffer) => {
       if (type === 'video') {
@@ -354,10 +363,8 @@ export class AirPlayServer extends EventEmitter {
     const units: Buffer[] = []
     let offset = 0
 
-    // NAL units can be prefixed with start codes (0x00000001 or 0x000001)
-    // or length-prefixed
     while (offset < payload.length) {
-      // Check for start code
+      // Check for annex-B start code (0x00000001 or 0x000001)
       if (offset + 3 < payload.length && payload[offset] === 0x00 && payload[offset + 1] === 0x00) {
         let startCodeLen = 0
         if (payload[offset + 2] === 0x00 && offset + 3 < payload.length && payload[offset + 3] === 0x01) {
@@ -369,7 +376,6 @@ export class AirPlayServer extends EventEmitter {
         if (startCodeLen > 0) {
           offset += startCodeLen
           let end = offset
-          // Find next start code
           while (end < payload.length) {
             if (end + 3 < payload.length && payload[end] === 0x00 && payload[end + 1] === 0x00) {
               if ((payload[end + 2] === 0x00 && end + 3 < payload.length && payload[end + 3] === 0x01) || payload[end + 2] === 0x01) {
@@ -384,30 +390,42 @@ export class AirPlayServer extends EventEmitter {
         }
       }
 
-      // Check for RTP-style NAL (FU-A fragmentation)
+      // RTP-style NAL handling
       const nalType = payload[offset] & 0x1f
+
       if (nalType >= 1 && nalType <= 23) {
         // Single NAL unit
         units.push(payload.subarray(offset))
         break
       } else if (nalType === 28) {
         // FU-A fragmented NAL
+        if (offset + 2 >= payload.length) break
+
+        const fuIndicator = payload[offset]
         const fuHeader = payload[offset + 1]
         const startBit = (fuHeader >> 7) & 0x01
         const endBit = (fuHeader >> 6) & 0x01
         const nalTypeFu = fuHeader & 0x1f
+        const nalData = payload.subarray(offset + 2)
 
         if (startBit) {
-          // Reconstruct NAL header from FU indicator + FU header
-          const nalHeader = (payload[offset] & 0xe0) | nalTypeFu
-          const nalData = payload.subarray(offset + 2)
-          units.push(Buffer.concat([Buffer.from([nalHeader]), nalData]))
+          // Reconstruct NAL header: keep NRI bits from indicator, replace type
+          const nalHeader = (fuIndicator & 0xe0) | nalTypeFu
+          this.fuBuffer = [Buffer.from([nalHeader]), nalData]
+        } else if (this.fuBuffer.length > 0) {
+          // Middle or end fragment — append data
+          this.fuBuffer.push(nalData)
         }
-        // For non-start fragments, we'd need to buffer and reassemble
-        // For MVP, just emit what we have
+
+        if (endBit && this.fuBuffer.length > 0) {
+          // Final fragment — emit complete NAL unit
+          units.push(Buffer.concat(this.fuBuffer))
+          this.fuBuffer = []
+        }
+
         break
       } else {
-        // Skip unknown NAL type
+        // Unknown NAL type, skip
         break
       }
     }

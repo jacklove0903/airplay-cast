@@ -85,6 +85,14 @@ export default function Player({ ws, streaming }: PlayerProps) {
     }
   }, [streaming, ws, startWebRTC])
 
+  // Reset WebRTC when WebSocket reconnects
+  useEffect(() => {
+    return () => {
+      pcRef.current?.close()
+      pcRef.current = null
+    }
+  }, [ws])
+
   // Cleanup when stream ends
   useEffect(() => {
     if (!streaming) {
