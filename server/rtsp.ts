@@ -22,6 +22,9 @@ export class AirPlayServer extends EventEmitter {
   private audioPort: number
   private fuBuffer: Buffer[] = []
   private udpSockets: dgram.Socket[] = []
+  private rtspState: 'init' | 'announced' | 'setup' | 'recording' = 'init'
+
+  private static readonly MAX_BUFFER_SIZE = 1024 * 1024 // 1MB
 
   constructor(controlPort = 7100) {
     super()
@@ -65,10 +68,18 @@ export class AirPlayServer extends EventEmitter {
     const clientAddr = `${socket.remoteAddress}:${socket.remotePort}`
     console.log(`[RTSP] Client connected: ${clientAddr}`)
     this.fuBuffer = []
+    this.rtspState = 'init'
     this.emit('client-connected', clientAddr)
 
     socket.on('data', (data: Buffer) => {
       buffer = Buffer.concat([buffer, data])
+
+      // Prevent unbounded buffer growth
+      if (buffer.length > AirPlayServer.MAX_BUFFER_SIZE) {
+        console.error('[RTSP] Buffer overflow, resetting connection')
+        socket.destroy()
+        return
+      }
 
       // Parse RTSP message(s) from buffer
       while (true) {
@@ -142,6 +153,16 @@ export class AirPlayServer extends EventEmitter {
     const cseq = req.headers['cseq'] || '1'
     console.log(`[RTSP] ${req.method} ${req.uri} (CSeq: ${cseq})`)
 
+    // OPTIONS is always allowed
+    if (req.method !== 'OPTIONS' && req.method !== 'GET_PARAMETER') {
+      // Validate RTSP method ordering
+      const validTransition = this.isValidTransition(req.method)
+      if (!validTransition) {
+        console.warn(`[RTSP] Invalid state transition: ${req.method} in state ${this.rtspState}`)
+        return this.buildResponse(cseq, 455, 'Method Not Valid In This State')
+      }
+    }
+
     switch (req.method) {
       case 'OPTIONS':
         return this.handleOptions(cseq)
@@ -162,6 +183,24 @@ export class AirPlayServer extends EventEmitter {
       default:
         console.log(`[RTSP] Unknown method: ${req.method}`)
         return this.buildResponse(cseq, 400, 'Bad Request')
+    }
+  }
+
+  private isValidTransition(method: string): boolean {
+    switch (method) {
+      case 'ANNOUNCE':
+        return this.rtspState === 'init'
+      case 'SETUP':
+        return this.rtspState === 'announced' || this.rtspState === 'setup'
+      case 'RECORD':
+        return this.rtspState === 'setup'
+      case 'FLUSH':
+      case 'SET_PARAMETER':
+        return this.rtspState === 'recording'
+      case 'TEARDOWN':
+        return this.rtspState !== 'init'
+      default:
+        return true
     }
   }
 
@@ -191,6 +230,7 @@ export class AirPlayServer extends EventEmitter {
     }
 
     this.emit('stream-announced', this.streamInfo)
+    this.rtspState = 'announced'
     return this.buildResponse(cseq, 200, 'OK')
   }
 
@@ -224,6 +264,8 @@ export class AirPlayServer extends EventEmitter {
       this.startRTPListener('video', this.videoPort)
     }
 
+    this.rtspState = 'setup'
+
     return this.buildResponse(cseq, 200, 'OK', {
       'Transport': `RTP/AVP/UDP;unicast;mode=record;server_port=${serverPort};control_port=${this.controlPort}`,
       'Session': this.rtspSession,
@@ -233,6 +275,7 @@ export class AirPlayServer extends EventEmitter {
 
   private handleRecord(cseq: string, req: RTSPRequest): string {
     console.log('[RTSP] RECORD - Stream starting')
+    this.rtspState = 'recording'
     this.emit('stream-start', this.streamInfo)
     return this.buildResponse(cseq, 200, 'OK', {
       'Session': this.rtspSession,
@@ -250,12 +293,20 @@ export class AirPlayServer extends EventEmitter {
 
   private handleTeardown(cseq: string): string {
     console.log('[RTSP] TEARDOWN - Stream ending')
+    this.rtspState = 'init'
     this.emit('stream-end')
     return this.buildResponse(cseq, 200, 'OK')
   }
 
   private handleSetParameter(cseq: string, req: RTSPRequest): string {
-    // volume or other params
+    const body = req.body.trim()
+    if (body.startsWith('volume:')) {
+      const volume = parseFloat(body.substring(7).trim())
+      if (!isNaN(volume)) {
+        console.log(`[RTSP] Volume set to ${volume}`)
+        this.emit('volume-change', volume)
+      }
+    }
     return this.buildResponse(cseq, 200, 'OK', {
       'Session': this.rtspSession,
     })
